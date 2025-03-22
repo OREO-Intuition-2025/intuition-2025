@@ -13,7 +13,7 @@ export function ChatUI() {
     append,
     isLoading,
     stop,
-  } = useChat((api = "localhost:8000/chat"));
+  } = useChat();
 
   return (
     <Chat
