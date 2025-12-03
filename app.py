@@ -1,430 +1,167 @@
-from langchain_community.document_loaders import DirectoryLoader, TextLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain.embeddings import CacheBackedEmbeddings
-from langchain.storage import LocalFileStore
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_chroma import Chroma
-from langchain.prompts import PromptTemplate
-from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
-from langchain import hub
-from langchain.schema import Document
-from langchain_community.tools.tavily_search import TavilySearchResults
-
-from langgraph.graph import END, StateGraph
-
-from typing_extensions import TypedDict
-from typing import List
-
+"""
+Streamlit UI for the Change Management Chat Assistant.
+Provides an interactive chat interface powered by the RAG workflow.
+"""
 import streamlit as st
+import logging
 
-from dotenv import load_dotenv
-import os
-
-load_dotenv()
-
-loader = DirectoryLoader(
-    "./knowledge-base",
-    glob="**/*.txt",
-    show_progress=True,
-    use_multithreading=True,
+from src.config import (
+    APP_TITLE,
+    KNOWLEDGE_BASE_DIR,
+    CACHE_DB_DIR,
+    EMBEDDING_MODEL,
+    LLM_MODEL,
+    CHUNK_SIZE,
+    CHUNK_OVERLAP,
+    TAVILY_API_KEY,
+    WEB_SEARCH_K,
 )
-docs = loader.load()
+from src.document_processor import DocumentProcessor
+from src.rag_workflow import RAGWorkflow
 
-print("Done loading")
-
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1000,
-    chunk_overlap=20,
-    length_function=len,
-    is_separator_regex=False,
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-
-texts = text_splitter.split_documents(docs)
-
-print("Done splitting")
-
-embeddings_model = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-mpnet-base-v2"
-)
-
-store = LocalFileStore("./cache_db")
-
-cached_embedder = CacheBackedEmbeddings.from_bytes_store(
-    embeddings_model, store, namespace=embeddings_model.model_name
-)
-
-print("Done embedding")
-
-db = Chroma.from_documents(texts, cached_embedder)
-
-print("Done loading into db")
-
-retriever = db.as_retriever()
-
-llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", format="json")
-
-# Question Router
-prompt = PromptTemplate(
-    template="""You are an expert at routing a user question to an agent, vectorstore or web search. \n
-        Use the agent when 
-        Use the vectorstore for questions on change management. \n
-        You do not need to be stringent with the keywords in the question related to these topics. \n
-        Otherwise, use web-search. Give a binary choice 'web_search' or 'vectorstore' based on the question. \n
-        Return the a JSON with a single key 'datasource' and no premable or explaination. \n
-        Question to route: {question}""",
-    input_variables=["question"],
-)
-
-question_router = prompt | llm | JsonOutputParser()
-
-# Grading Prompt
-grading_prompt = PromptTemplate(
-    template="""You are an expert at determining document relevance. \n
-    Given the question, evaluate if the document contains relevant keywords. \n
-    Return a JSON with a single key 'score' and value 'yes' or 'no'. \n
-    Question: {question} \n
-    Document: {document}""",
-    input_variables=["question", "document"],
-)
-
-grader = grading_prompt | llm | JsonOutputParser()
-
-# RAG Chain
-prompt = hub.pull("rlm/rag-prompt")
+logger = logging.getLogger(__name__)
 
 
-def format_docs(docs):
-    return "\n\n".join(doc.page_content for doc in docs)
-
-
-rag_chain = prompt | llm | StrOutputParser()
-
-# Hallucination Grader
-prompt = PromptTemplate(
-    template="""You are a grader assessing whether an answer is grounded in / supported by a set of facts. \n 
-    Here are the facts:
-    \n ------- \n
-    {documents} 
-    \n ------- \n
-    Here is the answer: {generation}
-    Give a binary score 'yes' or 'no' score to indicate whether the answer is grounded in / supported by a set of facts. \n
-    Provide the binary score as a JSON with a single key 'score' and no preamble or explanation.""",
-    input_variables=["generation", "documents"],
-)
-
-hallucination_grader = prompt | llm | JsonOutputParser()
-
-# Answer Grading
-prompt = PromptTemplate(
-    template="""You are a grader assessing whether an answer is useful to resolve a question. \n 
-    Here is the answer:
-    \n ------- \n
-    {generation} 
-    \n ------- \n
-    Here is the question: {question}
-    Give a binary score 'yes' or 'no' to indicate whether the answer is useful to resolve a question. \n
-    Provide the binary score as a JSON with a single key 'score' and no preamble or explanation.""",
-    input_variables=["generation", "question"],
-)
-
-answer_grader = prompt | llm | JsonOutputParser()
-
-# Question rewriter
-re_write_prompt = PromptTemplate(
-    template="""You a question re-writer that converts an input question to a better version that is optimized \n 
-     for vectorstore retrieval. Look at the initial and formulate an improved question. \n
-     Here is the initial question: \n\n {question}. Improved question with no preamble: \n """,
-    input_variables=["generation", "question"],
-)
-
-question_rewriter = re_write_prompt | llm | StrOutputParser()
-
-web_search_tool = TavilySearchResults(k=3, tavily_api_key=os.environ["TAVILY_API_KEY"])
-
-
-class GraphState(TypedDict):
+@st.cache_resource
+def initialize_system():
     """
-    Represents the state of our graph.
-
-    Attributes:
-        question: question
-        generation: LLM generation
-        documents: list of documents
-    """
-
-    question: str
-    generation: str
-    documents: List[str]
-
-
-def retrieve(state):
-    """
-    Retrieve documents
-
-    Args:
-        state (dict): The current graph state
-
+    Initialize the document processor and RAG workflow.
+    Uses Streamlit caching to avoid reloading on every interaction.
+    
     Returns:
-        state (dict): New key added to state, documents, that contains retrieved documents
+        RAGWorkflow instance ready for queries
     """
-    print("---RETRIEVE---")
-    question = state["question"]
-
-    # Retrieval
-    documents = retriever.get_relevant_documents(question)
-    return {"documents": documents, "question": question}
-
-
-def generate(state):
-    """
-    Generate answer
-
-    Args:
-        state (dict): The current graph state
-
-    Returns:
-        state (dict): New key added to state, generation, that contains LLM generation
-    """
-    print("---GENERATE---")
-    question = state["question"]
-    documents = state["documents"]
-
-    # RAG generation
-    generation = rag_chain.invoke({"context": documents, "question": question})
-    return {"documents": documents, "question": question, "generation": generation}
-
-
-def grade_documents(state):
-    """
-    Determines whether the retrieved documents are relevant to the question.
-
-    Args:
-        state (dict): The current graph state
-
-    Returns:
-        state (dict): Updates documents key with only filtered relevant documents
-    """
-
-    print("---CHECK DOCUMENT RELEVANCE TO QUESTION---")
-    question = state["question"]
-    documents = state["documents"]
-
-    # Score each doc
-    filtered_docs = []
-    for d in documents:
-        score = grader.invoke({"question": question, "document": d.page_content})
-        grade = score["score"]
-        if grade == "yes":
-            print("---GRADE: DOCUMENT RELEVANT---")
-            filtered_docs.append(d)
-        else:
-            print("---GRADE: DOCUMENT NOT RELEVANT---")
-            continue
-    return {"documents": filtered_docs, "question": question}
-
-
-def transform_query(state):
-    """
-    Transform the query to produce a better question.
-
-    Args:
-        state (dict): The current graph state
-
-    Returns:
-        state (dict): Updates question key with a re-phrased question
-    """
-
-    print("---TRANSFORM QUERY---")
-    question = state["question"]
-    documents = state["documents"]
-
-    # Re-write question
-    better_question = question_rewriter.invoke({"question": question})
-    return {"documents": documents, "question": better_question}
-
-
-def web_search(state):
-    """
-    Web search based on the re-phrased question.
-
-    Args:
-        state (dict): The current graph state
-
-    Returns:
-        state (dict): Updates documents key with appended web results
-    """
-
-    print("---WEB SEARCH---")
-    question = state["question"]
-
-    # Web search
-    docs = web_search_tool.invoke({"query": question})
-    web_results = "\n".join([d["content"] for d in docs])
-    web_results = Document(page_content=web_results)
-
-    return {"documents": web_results, "question": question}
-
-
-### Edges ###
-
-
-def route_question(state):
-    """
-    Route question to web search or RAG.
-
-    Args:
-        state (dict): The current graph state
-
-    Returns:
-        str: Next node to call
-    """
-
-    print("---ROUTE QUESTION---")
-    question = state["question"]
-    print(question)
-    source = question_router.invoke({"question": question})
-    print(source)
-    print(source["datasource"])
-    if source["datasource"] == "web_search":
-        print("---ROUTE QUESTION TO WEB SEARCH---")
-        return "web_search"
-    elif source["datasource"] == "vectorstore":
-        print("---ROUTE QUESTION TO RAG---")
-        return "vectorstore"
-
-
-def decide_to_generate(state):
-    """
-    Determines whether to generate an answer, or re-generate a question.
-
-    Args:
-        state (dict): The current graph state
-
-    Returns:
-        str: Binary decision for next node to call
-    """
-
-    print("---ASSESS GRADED DOCUMENTS---")
-    question = state["question"]
-    filtered_documents = state["documents"]
-
-    if not filtered_documents:
-        # All documents have been filtered check_relevance
-        # We will re-generate a new query
-        print(
-            "---DECISION: ALL DOCUMENTS ARE NOT RELEVANT TO QUESTION, TRANSFORM QUERY---"
-        )
-        return "transform_query"
-    else:
-        # We have relevant documents, so generate answer
-        print("---DECISION: GENERATE---")
-        return "generate"
-
-
-def grade_generation_v_documents_and_question(state):
-    """
-    Determines whether the generation is grounded in the document and answers question.
-
-    Args:
-        state (dict): The current graph state
-
-    Returns:
-        str: Decision for next node to call
-    """
-
-    print("---CHECK HALLUCINATIONS---")
-    question = state["question"]
-    documents = state["documents"]
-    generation = state["generation"]
-
-    score = hallucination_grader.invoke(
-        {"documents": documents, "generation": generation}
+    logger.info("Initializing system...")
+    
+    # Initialize document processor
+    doc_processor = DocumentProcessor(
+        knowledge_base_dir=KNOWLEDGE_BASE_DIR,
+        cache_dir=CACHE_DB_DIR,
+        embedding_model_name=EMBEDDING_MODEL,
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
     )
-    grade = score["score"]
-
-    # Check hallucination
-    if grade == "yes":
-        print("---DECISION: GENERATION IS GROUNDED IN DOCUMENTS---")
-        # Check question-answering
-        print("---GRADE GENERATION vs QUESTION---")
-        score = answer_grader.invoke({"question": question, "generation": generation})
-        grade = score["score"]
-        if grade == "yes":
-            print("---DECISION: GENERATION ADDRESSES QUESTION---")
-            return "useful"
-        else:
-            print("---DECISION: GENERATION DOES NOT ADDRESS QUESTION---")
-            return "not useful"
-    else:
-        print("---DECISION: GENERATION IS NOT GROUNDED IN DOCUMENTS, RE-TRY---")
-        return "not supported"
+    
+    # Process knowledge base and get retriever
+    db, retriever = doc_processor.process_knowledge_base()
+    
+    # Initialize RAG workflow
+    rag_workflow = RAGWorkflow(
+        retriever=retriever,
+        llm_model=LLM_MODEL,
+        tavily_api_key=TAVILY_API_KEY,
+        web_search_k=WEB_SEARCH_K,
+    )
+    
+    logger.info("System initialized successfully")
+    return rag_workflow
 
 
-workflow = StateGraph(GraphState)
+def main():
+    """Main Streamlit application."""
+    
+    # Page configuration
+    st.set_page_config(
+        page_title=APP_TITLE,
+        page_icon="🔄",
+        layout="wide",
+    )
+    
+    # App title and description
+    st.title(f"🔄 {APP_TITLE}")
+    st.markdown("""
+    Welcome to **Metamorphosis** - your AI-powered assistant for change management guidance.
+    
+    Ask questions about:
+    - **Change Management Models**: Lewin's Model, Kotter's 8-Step, McKinsey 7S, ADKAR
+    - **Organizational Change Strategies**
+    - **Resistance Management**
+    - **Transformation Best Practices**
+    """)
+    
+    # Initialize system (cached)
+    try:
+        with st.spinner("Loading knowledge base..."):
+            rag_workflow = initialize_system()
+    except Exception as e:
+        st.error(f"Failed to initialize system: {str(e)}")
+        logger.error(f"Initialization error: {str(e)}", exc_info=True)
+        return
+    
+    # Initialize chat history in session state
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    
+    # Display chat history
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+    
+    # Chat input
+    if prompt := st.chat_input("How can I help with your change management needs?"):
+        # Add user message to history and display
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        # Generate and display assistant response
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                try:
+                    # Stream workflow execution
+                    stream = rag_workflow.query(prompt)
+                    full_response = ""
+                    
+                    # Extract generation from workflow output
+                    for chunk in stream:
+                        if "generate" in chunk:
+                            response = chunk["generate"]["generation"]
+                            if response and response != full_response:
+                                full_response = response
+                    
+                    # Display response
+                    if full_response:
+                        st.markdown(full_response)
+                    else:
+                        full_response = "I apologize, but I couldn't generate a response. Please try rephrasing your question."
+                        st.warning(full_response)
+                    
+                except Exception as e:
+                    full_response = f"An error occurred: {str(e)}"
+                    st.error(full_response)
+                    logger.error(f"Query error: {str(e)}", exc_info=True)
+        
+        # Add assistant response to history
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
+    
+    # Sidebar with information
+    with st.sidebar:
+        st.header("About")
+        st.markdown("""
+        This assistant uses:
+        - **RAG** (Retrieval-Augmented Generation)
+        - **Vector Search** for knowledge retrieval
+        - **LLM** (Gemini 2.0) for generation
+        - **Quality Checks** for accurate responses
+        """)
+        
+        st.header("Features")
+        st.markdown("""
+        ✅ Grounded answers from curated sources  
+        ✅ Web search fallback for current info  
+        ✅ Hallucination detection  
+        ✅ Answer relevance checking  
+        """)
+        
+        if st.button("Clear Chat History"):
+            st.session_state.messages = []
+            st.rerun()
 
-# Define the nodes
-workflow.add_node("web_search", web_search)  # web search
-workflow.add_node("retrieve", retrieve)  # retrieve
-workflow.add_node("grade_documents", grade_documents)  # grade documents
-workflow.add_node("generate", generate)  # generate
-workflow.add_node("transform_query", transform_query)  # transform_query
 
-# Build graph
-workflow.set_conditional_entry_point(
-    route_question,
-    {
-        "web_search": "web_search",
-        "vectorstore": "retrieve",
-    },
-)
-workflow.add_edge("web_search", "generate")
-workflow.add_edge("retrieve", "grade_documents")
-workflow.add_conditional_edges(
-    "grade_documents",
-    decide_to_generate,
-    {
-        "transform_query": "transform_query",
-        "generate": "generate",
-    },
-)
-workflow.add_edge("transform_query", "retrieve")
-workflow.add_conditional_edges(
-    "generate",
-    grade_generation_v_documents_and_question,
-    {
-        "not supported": "generate",
-        "useful": END,
-        "not useful": "transform_query",
-    },
-)
-
-# Compile
-app = workflow.compile(checkpointer=memory)
-
-st.title("Metamorphosis")
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-if prompt := st.chat_input("How can I help your change?"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    with st.chat_message("assistant"):
-        question = st.session_state.messages[-1]["content"]
-        stream = app.stream({"question": question})
-        full_response = ""
-        for chunk in stream:
-            if "generate" in chunk:
-                response = chunk["generate"]["generation"]
-            else:
-                response = ""
-            st.write(response)
-            full_response = full_response + response
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+if __name__ == "__main__":
+    main()
