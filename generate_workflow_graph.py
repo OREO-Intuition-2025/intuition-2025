@@ -33,13 +33,19 @@ class GraphState(TypedDict):
 
 
 def route_question(state):
-    """Route to vectorstore or web search."""
+    """Route to vectorstore, web search, or hybrid."""
     return "vectorstore"  # Dummy implementation
 
 
 def route_after_transform(state):
     """Route back to original source after transform."""
-    return state.get("source", "vectorstore")
+    source = state.get("source", "vectorstore")
+    if source == "hybrid":
+        return "hybrid_search"
+    elif source == "web_search":
+        return "web_search"
+    else:
+        return "vectorstore"
 
 
 def decide_to_generate(state):
@@ -77,11 +83,17 @@ def web_search(state):
     return state
 
 
+def hybrid_search(state):
+    """Perform hybrid search (vectorstore + web)."""
+    return state
+
+
 # Build the workflow graph
 workflow = StateGraph(GraphState)
 
 # Add all nodes
 workflow.add_node("web_search", web_search)
+workflow.add_node("hybrid_search", hybrid_search)
 workflow.add_node("retrieve", retrieve)
 workflow.add_node("grade_documents", grade_documents)
 workflow.add_node("generate", generate)
@@ -93,11 +105,13 @@ workflow.set_conditional_entry_point(
     {
         "web_search": "web_search",
         "vectorstore": "retrieve",
+        "hybrid_search": "hybrid_search",
     },
 )
 
 # Add edges
 workflow.add_edge("web_search", "generate")
+workflow.add_edge("hybrid_search", "grade_documents")
 workflow.add_edge("retrieve", "grade_documents")
 
 # Add conditional edges
@@ -116,6 +130,7 @@ workflow.add_conditional_edges(
     {
         "web_search": "web_search",
         "vectorstore": "retrieve",
+        "hybrid_search": "hybrid_search",
     },
 )
 
@@ -147,9 +162,11 @@ try:
     
     print(f"✅ Graph saved to {output_path}")
     print("\nGraph shows the complete RAG workflow:")
-    print("- Entry: route_question (vectorstore vs web_search)")
-    print("- Main path: retrieve → grade_documents → generate")
-    print("- Loops: transform_query → retrieve (retry with better question)")
+    print("- Entry: route_question (vectorstore vs web_search vs hybrid)")
+    print("- Paths: retrieve → grade_documents → generate")
+    print("         web_search → generate")
+    print("         hybrid_search → grade_documents → generate")
+    print("- Loops: transform_query → route_after_transform → [source]")
     print("- Quality checks: generate → grade → END or retry")
     
 except Exception as e:

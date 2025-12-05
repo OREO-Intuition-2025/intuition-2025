@@ -19,7 +19,12 @@ Use web-search for:
 - Recent developments
 - General knowledge not specific to change management
 
-Return ONLY valid JSON using double quotes (not single quotes) with a single key "datasource" and value either "web_search" or "vectorstore".
+Use hybrid for questions that need both:
+- Historical change management knowledge AND current trends/events
+- Evolution of practices over time
+- Recent developments in established methodologies
+
+Return ONLY valid JSON using double quotes (not single quotes) with a single key "datasource" and value either "web_search", "vectorstore", or "hybrid".
 Example: {{"datasource": "vectorstore"}}
 Do not include any preamble, explanation, or markdown formatting.
 

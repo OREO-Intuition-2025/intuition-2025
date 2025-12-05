@@ -4,12 +4,10 @@ A specialized AI-powered chat assistant designed to provide expert guidance on c
 
 ## Features
 
-- **Interactive Chat Interface**: Streamlit-based UI for natural language Q&A about change management.
-- **RAG-Powered Responses**: Retrieves relevant information from a curated knowledge base of academic papers and articles, ensuring grounded and accurate answers.
-- **Intelligent Routing**: Automatically routes queries to vector search (for change management topics) or web search (for general queries).
+- **Intelligent Routing**: Automatically routes queries to vectorstore (change management), web search (current events), or hybrid (both sources combined).
 - **Quality Assurance**: Includes document relevance grading, hallucination detection, and answer usefulness checks.
-- **Model Recommendation**: Exploratory analysis in the notebook for recommending change management models based on contextual factors (urgency, complexity, resistance, change level).
-- **Data Pipeline**: Automated scraping of academic resources to build and update the knowledge base.
+- **Conversation Memory**: Maintains context across up to 3 conversation turns.
+- **Hybrid Search**: Combines historical knowledge base with current web search for comprehensive answers.
 
 ## Installation
 
@@ -72,6 +70,16 @@ A specialized AI-powered chat assistant designed to provide expert guidance on c
    ```
    Open the provided URL in your browser. Ask questions like "What is Lewin's change model?" or "How to handle resistance in organizational change?"
 
+### Generating Workflow Graph
+
+To generate a visual diagram of the RAG workflow:
+
+```bash
+python generate_workflow_graph.py
+```
+
+This creates `workflow_graph.png` showing the complete LangGraph structure with all nodes, edges, and decision points.
+
 ### Running Analysis (Notebook)
 
 Open `intuition-change-management.ipynb` in Jupyter and run cells to:
@@ -92,12 +100,15 @@ intuition-2025/
 │   ├── prompts.py                  # LLM prompt templates
 │   └── rag_workflow.py             # LangGraph RAG pipeline
 ├── scraper.py                      # Script to scrape and build knowledge base
+├── generate_workflow_graph.py      # Generate visual workflow diagram
 ├── intuition-change-management.ipynb  # Notebook for model analysis
 ├── links.txt                       # List of URLs for scraping
 ├── requirements.txt                # Python dependencies
 ├── .env.example                    # Template for environment variables
+├── .gitignore                      # Git ignore rules
 ├── README.md                       # This file
 ├── STRUCTURE.md                    # Detailed architecture documentation
+├── workflow_graph.png              # Generated workflow visualization
 ├── knowledge-base/                 # Scraped text files (input-*.txt)
 └── cache_db/                       # Cached embeddings for performance
 ```
@@ -131,7 +142,7 @@ The graph above shows the complete question-answering pipeline with all decision
                       ┌───────────────────────┐
                       │  route_question()     │
                       │  Decision: vectorstore│
-                      │  or web_search?       │
+                      │  web_search, or hybrid│
                       └───────┬───────────────┘
                               │
                  ┌────────────┴────────────┐
@@ -204,6 +215,7 @@ The graph above shows the complete question-answering pipeline with all decision
 - **route_question()** analyzes the question and decides:
   - **"vectorstore"** → Questions about change management (Lewin, Kotter, resistance, etc.)
   - **"web_search"** → General queries or current events
+  - **"hybrid"** → Questions needing both historical knowledge + current trends/events
 
 #### **Path 1: Vectorstore (Change Management Questions)**
 
@@ -220,6 +232,16 @@ The graph above shows the complete question-answering pipeline with all decision
 1. **web_search** → Query Tavily API for current information (marks source as "web_search")
 2. Proceed directly to **generate**
 3. If answer not useful → **transform_query** → **route_after_transform** → Loop back to **web_search**
+
+#### **Path 3: Hybrid Search (Comprehensive Questions)**
+
+1. **hybrid_search** → Perform both vectorstore retrieval AND web search simultaneously
+2. **grade_documents** → LLM evaluates combined document relevance from both sources
+   - **Relevant docs found?**
+     - ✅ **Yes** → Proceed to **generate**
+     - ❌ **No** → Go to **transform_query** (rewrite question)
+3. **transform_query** → Rewrite question for better retrieval
+4. **route_after_transform** → Check source → Loop back to **hybrid_search**
 
 #### **Answer Generation & Quality Checks**
 

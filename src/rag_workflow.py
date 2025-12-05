@@ -67,12 +67,14 @@ class GraphState(TypedDict):
         documents: Retrieved or searched documents
         source: Source of documents ('vectorstore' or 'web_search')
         retry_count: Number of retries attempted
+        chat_history: Previous conversation turns for context
     """
     question: str
     generation: str
     documents: List[str]
     source: str
     retry_count: int
+    chat_history: str
 
 
 class RAGWorkflow:
@@ -122,12 +124,14 @@ class RAGWorkflow:
         # Document grader chain - with safe JSON parsing
         self.grader = document_grader_prompt | self.llm_json | safe_parser
         
-        # RAG answer generation chain (create local prompt)
+        # RAG answer generation chain (create local prompt with chat history)
         rag_prompt = PromptTemplate.from_template(
-            "You are an assistant for question-answering tasks. "
-            "Use the following pieces of retrieved context to answer the question. "
-            "If you don't know the answer, just say that you don't know. "
-            "Keep the answer concise and helpful.\n\n"
+            "You are an assistant for change management and organizational transformation. "
+            "Use the following context to answer the question. "
+            "If the context doesn't fully address the question, provide general change management principles "
+            "and organizational best practices that could be helpful. "
+            "Be practical and actionable in your advice.\n\n"
+            "Previous conversation:\n{chat_history}\n\n"
             "Context: {context}\n\n"
             "Question: {question}\n\n"
             "Answer:"
@@ -175,8 +179,13 @@ class RAGWorkflow:
         logger.info("---GENERATE---")
         question = state["question"]
         documents = state["documents"]
+        chat_history = state.get("chat_history", "No previous conversation.")
         
-        generation = self.rag_chain.invoke({"context": documents, "question": question})
+        generation = self.rag_chain.invoke({
+            "context": documents, 
+            "question": question,
+            "chat_history": chat_history
+        })
         return {"documents": documents, "question": question, "generation": generation}
     
     def grade_documents(self, state):
@@ -193,8 +202,11 @@ class RAGWorkflow:
         question = state["question"]
         documents = state["documents"]
         source = state.get("source", "vectorstore")
+        retry_count = state.get("retry_count", 0)
         
         filtered_docs = []
+        rejected_docs = []
+        
         for d in documents:
             score = self.grader.invoke({"question": question, "document": d.page_content})
             grade = score["score"]
@@ -203,6 +215,12 @@ class RAGWorkflow:
                 filtered_docs.append(d)
             else:
                 logger.info("---GRADE: DOCUMENT NOT RELEVANT---")
+                rejected_docs.append(d)
+        
+        # If we have no relevant docs and have retried, keep top 2 rejected docs anyway
+        if not filtered_docs and retry_count > 0:
+            logger.warning("---NO RELEVANT DOCS FOUND, KEEPING TOP 2 ANYWAY---")
+            filtered_docs = rejected_docs[:2] if rejected_docs else documents[:2]
                 
         return {"documents": filtered_docs, "question": question, "source": source}
     
@@ -244,6 +262,32 @@ class RAGWorkflow:
         
         return {"documents": web_results, "question": question, "source": "web_search"}
     
+    def hybrid_search(self, state):
+        """
+        Perform both vectorstore retrieval and web search for comprehensive answers.
+        
+        Args:
+            state: Current graph state
+            
+        Returns:
+            Updated state with combined results
+        """
+        logger.info("---HYBRID SEARCH---")
+        question = state["question"]
+        
+        # Get vectorstore documents
+        vector_docs = self.retriever.invoke(question)
+        
+        # Get web search results
+        web_docs = self.web_search_tool.invoke({"query": question})
+        web_results = "\n".join([d["content"] for d in web_docs])
+        web_doc = Document(page_content=web_results)
+        
+        # Combine both sources
+        combined_docs = vector_docs + [web_doc]
+        
+        return {"documents": combined_docs, "question": question, "source": "hybrid"}
+    
     # Edge functions (routing logic)
     def route_question(self, state):
         """
@@ -266,6 +310,11 @@ class RAGWorkflow:
             return "web_search"
         elif source["datasource"] == "vectorstore":
             return "vectorstore"
+        elif source["datasource"] == "hybrid":
+            return "hybrid_search"
+        else:
+            # Default fallback
+            return "vectorstore"
     
     def decide_to_generate(self, state):
         """
@@ -279,6 +328,12 @@ class RAGWorkflow:
         """
         logger.info("---ASSESS GRADED DOCUMENTS---")
         filtered_documents = state["documents"]
+        retry_count = state.get("retry_count", 0)
+        
+        # If we've retried multiple times, just generate with what we have
+        if retry_count >= 2:
+            logger.warning(f"---MAX RETRIES REACHED ({retry_count}), GENERATING ANYWAY---")
+            return "generate"
         
         if not filtered_documents:
             logger.info("---DECISION: TRANSFORM QUERY---")
@@ -299,7 +354,13 @@ class RAGWorkflow:
         """
         source = state.get("source", "vectorstore")
         logger.info(f"---ROUTE AFTER TRANSFORM: {source}---")
-        return source
+        
+        if source == "hybrid":
+            return "hybrid_search"
+        elif source == "web_search":
+            return "web_search"
+        else:
+            return "vectorstore"
     
     def grade_generation_v_documents_and_question(self, state):
         """
@@ -359,6 +420,7 @@ class RAGWorkflow:
         
         # Define nodes
         workflow.add_node("web_search", self.web_search)
+        workflow.add_node("hybrid_search", self.hybrid_search)
         workflow.add_node("retrieve", self.retrieve)
         workflow.add_node("grade_documents", self.grade_documents)
         workflow.add_node("generate", self.generate)
@@ -370,10 +432,12 @@ class RAGWorkflow:
             {
                 "web_search": "web_search",
                 "vectorstore": "retrieve",
+                "hybrid_search": "hybrid_search",
             },
         )
         
         workflow.add_edge("web_search", "generate")
+        workflow.add_edge("hybrid_search", "grade_documents")
         workflow.add_edge("retrieve", "grade_documents")
         
         workflow.add_conditional_edges(
@@ -391,6 +455,7 @@ class RAGWorkflow:
             {
                 "web_search": "web_search",
                 "vectorstore": "retrieve",
+                "hybrid_search": "hybrid_search",
             },
         )
         
@@ -406,17 +471,39 @@ class RAGWorkflow:
         
         logger.info("Workflow graph built successfully")
         
-        # Compile with increased recursion limit
-        return workflow.compile({"recursion_limit": 50})
+        # Compile workflow
+        from langgraph.checkpoint.memory import MemorySaver
+        
+        # Use MemorySaver for checkpointing to enable recursion_limit
+        memory = MemorySaver()
+        return workflow.compile(checkpointer=memory)
     
-    def query(self, question):
+    def query(self, question, chat_history=None):
         """
         Process a user question through the workflow.
         
         Args:
             question: User's question string
+            chat_history: Optional list of previous message dicts with 'role' and 'content'
             
         Returns:
             Generator yielding workflow state updates
         """
-        return self.app.stream({"question": question})
+        # Format chat history for context
+        history_text = "No previous conversation."
+        if chat_history and len(chat_history) > 0:
+            # Take last 6 messages (3 turns) to keep context manageable
+            recent_history = chat_history[-6:]
+            history_lines = []
+            for msg in recent_history:
+                role = "User" if msg["role"] == "user" else "Assistant"
+                history_lines.append(f"{role}: {msg['content']}")
+            history_text = "\n".join(history_lines)
+        
+        # Create config with thread_id for checkpointing
+        config = {"configurable": {"thread_id": "default"}, "recursion_limit": 50}
+        
+        return self.app.stream({
+            "question": question,
+            "chat_history": history_text
+        }, config=config)

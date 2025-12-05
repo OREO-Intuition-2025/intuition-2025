@@ -113,8 +113,11 @@ def main():
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 try:
-                    # Stream workflow execution
-                    stream = rag_workflow.query(prompt)
+                    # Pass chat history (excluding current message) to maintain context
+                    history_for_context = st.session_state.messages[:-1] if len(st.session_state.messages) > 0 else []
+                    
+                    # Stream workflow execution with chat history
+                    stream = rag_workflow.query(prompt, chat_history=history_for_context)
                     full_response = ""
                     
                     # Extract generation from workflow output
@@ -156,6 +159,7 @@ def main():
         ✅ Web search fallback for current info  
         ✅ Hallucination detection  
         ✅ Answer relevance checking  
+        ✅ Conversation memory (last 3 turns)  
         """)
         
         if st.button("Clear Chat History"):
